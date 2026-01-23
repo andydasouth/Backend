@@ -1,78 +1,135 @@
-import { NextResponse } from "next/server";
-import OpenAI from "openai";
+import OpenAI from 'openai';
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY!,
-});
+export const runtime = 'nodejs';
 
-/**
- * ✅ REQUIRED
- * Prevents 405 errors when Expo / browser probes the endpoint
- */
-export async function GET() {
-  return NextResponse.json(
-    { status: "ok" },
-    {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-      },
-    }
-  );
+type ChatMessage = {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+};
+
+type RequestBody = {
+  messages: ChatMessage[];
+};
+
+function corsHeaders(origin: string | null) {
+  return {
+    'Access-Control-Allow-Origin': origin ?? '*',
+    'Access-Control-Allow-Methods': 'POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin',
+  };
 }
 
-/**
- * ✅ REQUIRED
- * Handles CORS preflight for browser / Expo
- */
-export async function OPTIONS() {
-  return NextResponse.json(
-    {},
-    {
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      },
-    }
-  );
+function jsonResponse(
+  status: number,
+  data: unknown,
+  origin: string | null
+) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...corsHeaders(origin),
+    },
+  });
 }
 
-/**
- * ✅ MAIN CHAT HANDLER
- */
+async function verifySupabaseToken(token: string) {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+
+  if (!supabaseUrl || !supabaseAnonKey) {
+    throw new Error('Missing SUPABASE_URL or SUPABASE_ANON_KEY');
+  }
+
+  const res = await fetch(`${supabaseUrl}/auth/v1/user`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      apikey: supabaseAnonKey,
+    },
+  });
+
+  if (!res.ok) return null;
+  return await res.json();
+}
+
+export async function OPTIONS(req: Request) {
+  return new Response(null, {
+    status: 204,
+    headers: corsHeaders(req.headers.get('origin')),
+  });
+}
+
 export async function POST(req: Request) {
-  try {
-    const body = await req.json();
-    const { prompt } = body;
+  const origin = req.headers.get('origin');
 
-    if (!prompt) {
-      return NextResponse.json(
-        { error: "Prompt is required" },
-        { status: 400 }
-      );
+  try {
+    // --- Authorization ---
+    const authHeader = req.headers.get('authorization') || '';
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (!match) {
+      return jsonResponse(401, { error: 'Unauthorized' }, origin);
     }
 
-    const completion = await openai.chat.completions.create({
-      model: process.env.AI_MODEL || "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: Number(process.env.AI_MAX_TOKENS || 500),
+    const token = match[1];
+    const user = await verifySupabaseToken(token);
+    if (!user) {
+      return jsonResponse(401, { error: 'Unauthorized' }, origin);
+    }
+
+    // --- Request body ---
+    const body = (await req.json()) as RequestBody;
+    if (!body.messages || !Array.isArray(body.messages)) {
+      return jsonResponse(400, { error: 'Invalid messages' }, origin);
+    }
+
+    // --- OpenAI setup ---
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return jsonResponse(500, { error: 'Missing OPENAI_API_KEY' }, origin);
+    }
+
+    const model = process.env.AI_MODEL || 'gpt-4.1-mini';
+    const maxOutputTokens = Math.max(
+      1,
+      Math.min(Number(process.env.AI_MAX_OUTPUT_TOKENS || 800), 2000)
+    );
+
+    const openai = new OpenAI({ apiKey });
+
+    // --- OpenAI Responses API ---
+    const response = await openai.responses.create({
+      model,
+      input: body.messages,
+      max_output_tokens: maxOutputTokens,
     });
 
-    return NextResponse.json(
+    const output =
+      (response as any).output_text ??
+      '';
+
+    const usage = (response as any).usage || {};
+    const inputTokens = usage.input_tokens ?? 0;
+    const outputTokens = usage.output_tokens ?? 0;
+    const totalTokens = usage.total_tokens ?? inputTokens + outputTokens;
+
+    return jsonResponse(
+      200,
       {
-        reply: completion.choices[0].message.content,
-      },
-      {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
+        output: String(output),
+        usage: {
+          inputTokens,
+          outputTokens,
+          totalTokens,
         },
-      }
+        model: response.model || model,
+      },
+      origin
     );
-  } catch (error) {
-    console.error("Chat API error:", error);
-    return NextResponse.json(
-      { error: "Internal server error" },
-      { status: 500 }
-    );
+  } catch (err: any) {
+    console.error('[api/chat] error:', err);
+    return jsonResponse(500, { error: 'Internal server error' }, origin);
   }
 }
