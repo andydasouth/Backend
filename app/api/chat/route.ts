@@ -1,4 +1,4 @@
-import OpenAI from 'openai';
+import Anthropic from '@anthropic-ai/sdk';
 
 export const runtime = 'nodejs';
 
@@ -85,35 +85,40 @@ export async function POST(req: Request) {
       return jsonResponse(400, { error: 'Invalid messages' }, origin);
     }
 
-    // --- OpenAI setup ---
-    const apiKey = process.env.OPENAI_API_KEY;
+    // --- Anthropic setup ---
+    const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
-      return jsonResponse(500, { error: 'Missing OPENAI_API_KEY' }, origin);
+      return jsonResponse(500, { error: 'Missing ANTHROPIC_API_KEY' }, origin);
     }
 
-    const model = process.env.AI_MODEL || 'gpt-4.1-mini';
+    const model = process.env.AI_MODEL || 'claude-sonnet-4-20250514';
     const maxOutputTokens = Math.max(
       1,
-      Math.min(Number(process.env.AI_MAX_OUTPUT_TOKENS || 800), 2000)
+      Math.min(Number(process.env.AI_MAX_OUTPUT_TOKENS || 800), 8096)
     );
 
-    const openai = new OpenAI({ apiKey });
+    const anthropic = new Anthropic({ apiKey });
 
-    // --- OpenAI Responses API ---
-    const response = await openai.responses.create({
+    // Anthropic separates system messages from the conversation
+    const systemMessage = body.messages.find(m => m.role === 'system');
+    const conversationMessages = body.messages
+      .filter(m => m.role !== 'system')
+      .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+
+    // --- Anthropic Messages API ---
+    const response = await anthropic.messages.create({
       model,
-      input: body.messages,
-      max_output_tokens: maxOutputTokens,
+      max_tokens: maxOutputTokens,
+      ...(systemMessage ? { system: systemMessage.content } : {}),
+      messages: conversationMessages,
     });
 
     const output =
-      (response as any).output_text ??
-      '';
+      response.content[0]?.type === 'text' ? response.content[0].text : '';
 
-    const usage = (response as any).usage || {};
-    const inputTokens = usage.input_tokens ?? 0;
-    const outputTokens = usage.output_tokens ?? 0;
-    const totalTokens = usage.total_tokens ?? inputTokens + outputTokens;
+    const inputTokens = response.usage.input_tokens;
+    const outputTokens = response.usage.output_tokens;
+    const totalTokens = inputTokens + outputTokens;
 
     return jsonResponse(
       200,
@@ -124,7 +129,7 @@ export async function POST(req: Request) {
           outputTokens,
           totalTokens,
         },
-        model: response.model || model,
+        model: response.model,
       },
       origin
     );
